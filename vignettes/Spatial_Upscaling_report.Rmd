@@ -1,0 +1,265 @@
+---
+title: "Spatial Upscaling"
+author: 'Noémie Wellinger'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Background
+Spatial upscaling is one of the major challenges in modelling. 
+
+## Ludwig et al.
+
+*Explain the difference between a random cross-validation and a spatial cross-validation.*
+Random and spatial crossvalidation use different partitioning methods. 
+
+
+    
+*In spatial upscaling, we model the target based on environmental covariates. This implies that we assume the training data to sufficiently represent the conditions on which the model will be applied for generating predictions. Prediction errors may increase with an increasing distance of the prediction location from the training locations. The paper by Ludwig et al. (2023) considers this “distance” as a geographical distance in Euclidian space. Do you see an alternative to measuring a distance that considers the task of spatial upscaling based on environmental covariates more directly?*
+
+
+## Data
+Observational leaf nitrogen (N) content. 
+Environmental covariates with global coverage (limited subset):
+* leafN: leaf nitrogen content, in mass-based concentration units (gN gDM)
+* lon: longitude in decimal degrees east
+* lat: latitude in decimal degrees north
+* elv: Elevation above sea level (m)
+* mat: mean annual temperature (degrees Celsius)
+* map: mean annual precipitation (mm yr)
+* ndep: atmospheric nitrogen deposition g m
+* yrmai: mean annual daily irradiance µmol m 
+* sSpecies: species name of the plant on which leaf N was measured
+
+```{r libs, include=FALSE}
+library(tidyverse)
+library(skimr)
+library(rsample)
+library(ranger)
+library(caret)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+```{r load_data, include = F}
+# load data from online source
+df <- readr::read_csv("https://raw.githubusercontent.com/stineb/leafnp_data/main/data/leafnp_tian_et_al.csv")
+```
+
+```{r select_variables, include = F}
+common_species <- df |> 
+  group_by(Species) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count)) |> 
+  slice(1:50) |> 
+  pull(Species)
+
+dfs <- df |> 
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |> 
+  filter(Species %in% common_species) |>
+  mutate(Species = as.factor(Species))
+  # group_by(lon, lat) |> 
+  # summarise(across(where(is.numeric), mean))
+
+# quick overview of data
+skimr::skim(dfs)
+
+# missing data
+visdat::vis_miss(dfs)
+```
+
+# Analysis
+## Random cross-validation
+The aim is to use Random Forest to perform a 5-fold cross-validation with the leaf N data (leafN) and the following predictors: 
+* elv: Elevation above sea level (m)
+* mat: mean annual temperature (degrees Celsius)
+* map: mean annual precipitation (mm yr)
+* ndep: atmospheric nitrogen deposition g m
+* mai: mean annual daily irradiance µmol m 
+* Species: species name of the plant on which leaf N was measured
+
+Training and testing data are split in a 75%/25% proportion, with ´leafN´ as the stratification variable. This ensures that the distribution of the target variable (´leafN´) is similar in both the training and testing sets.
+
+```{r model_prep, include = F}
+# Specify target: The pH in the top 10cm
+target <- "leafN"
+
+# Specify predictors_all: Remove soil sampling and observational data
+predictors_all <- c("elv", "mat", "map", "ndep", "mai", "Species")
+
+# # Split dataset into training and testing sets
+# set.seed(123)  # for reproducibility
+# split <- rsample::initial_split(dfs, prop = 0.75, strata = "leafN") 
+# df_train <- rsample::training(split)
+# df_test <- rsample::testing(split)
+# 
+# # Filter out any NA to avoid error when running a Random Forest
+# df_train <- df_train |> tidyr::drop_na()
+# df_test <- df_test   |> tidyr::drop_na()
+```
+
+
+```{r}
+# The same model formulation is in the previous chapter
+pp <- recipes::recipe(leafN ~ elv + mat + map + ndep + mai + Species, 
+                      data = dfs) |> 
+  recipes::step_center(recipes::all_numeric(), -recipes::all_outcomes()) |>
+  recipes::step_scale(recipes::all_numeric(), -recipes::all_outcomes())
+
+mod <- caret::train(
+  pp, 
+  data = dfs |> drop_na(), 
+  method = "ranger",
+  trControl = trainControl(method = "cv", number = 5, savePredictions = "final"),
+  # Set hyperparameters to other than default:
+    tuneGrid = expand.grid( .mtry = 3,
+                          .min.node.size = 12,
+                          .splitrule = "variance"),
+  metric = "RMSE",
+  replace = FALSE,
+  sample.fraction = 0.5,
+  num.trees = 500,    # high number ok since no hyperparam tuning
+  seed = 32 # for reproducibility
+)
+
+# Print a summary of fitted model
+print(mod)
+```
+
+## Spatial cross-validation
+View the distribution of data across the globe:
+```{r sourceplot, echo = T}
+# get coast outline
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+ggplot() +
+
+  # plot coastline
+  geom_sf(data = coast,
+          colour = 'black',
+          size = 0.2) +
+
+  # set extent in longitude and latitude
+  coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE) +  # to draw map strictly bounded by the specified extent
+  
+  # plot points on map
+  geom_point(data = dfs, aes(x = lon, y = lat), color = "red", size = 0.2) +
+  labs(x = "", y = "") +
+  theme(legend.position = "bottom")
+```
+The data appears to be spatially biased, with a vast majority of data points in Europe, some in Eastern Asia, and little to none in the rest of the world. The accuracy of a model trained on this data and upscaled to the whole globe will vary over geographical space. Models perform better for data that is similar to the training data. We can assume that geographical distance to observational data points in this case, is a pretty good metric for similar leaf N content. Therefore, the upscaling should work best, where there is a lot of observational data. There might also be geographically distant areas that show similar leaf N and covariates to the observation. There, we should also see a better model performance.
+
+### K-means clustering
+Identify geographical clusters of the data using the k-means algorithm (an unsupervised machine learning method), considering the longitude and latitude of data points and setting. Plot points on a global map, showing the five clusters with distinct colors.
+
+```{r}
+# cluster the data 
+clusters <- kmeans(
+  dfs |> dplyr::select(lon, lat),
+  centers = 5
+)
+
+dfs_cluster <- dfs |>
+  mutate(cluster = as.factor(clusters$cluster))
+
+ggplot() +
+  geom_sf(data = coast,
+          colour = 'black',
+          size = 0.2) +
+  coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE) +
+  # plot points on map
+  geom_point(data = dfs_cluster, aes(x = lon, y = lat, color = cluster),  size = 0.2) +
+  labs(x = "", y = "") +
+  theme(legend.position = "bottom")
+```
+Some of the clustering seems a bit odd, like the blue cluster with North & South America and Western Europe.
+
+The distribution of leaf N by cluster looks like this:
+```{r}
+ggplot(dfs_cluster, aes(x = factor(cluster), y = leafN, fill = cluster)) +
+  geom_boxplot() +
+  labs(title = "Distribution of leaf nitrogen content by cluster",
+       x = "Cluster",
+       y = "leaf N") +
+  scale_fill_discrete(name = "cluster") +
+  theme_minimal()
+
+```
+The clusters do not all look markedly different. Cluster 4 (Western Europe/Americas) and 5 (Central Europe) look very similar. Clusters 2 (Eastern Europe) and 3 (Scandinavia) have lower variance. Cluster 1 (Eastern Asia) has the highest variance.
+
+### Data splitting and model training
+The clusters serve as pre-defined groups for the k-fold-cross-validation.
+```{r}
+# create folds based on clusters
+# assuming 'df' contains the data and a column called 'cluster' containing the 
+# result of the k-means clustering
+group_folds_train <- purrr::map(
+  seq(length(unique(dfs_cluster$cluster))),
+  ~ {
+    dfs_cluster |> 
+      select(cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(cluster != .) |> 
+      pull(idx)
+  }
+)
+
+group_folds_test <- purrr::map(
+  seq(length(unique(dfs_cluster$cluster))),
+  ~ {
+    dfs_cluster |> 
+      select(cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(cluster == .) |> 
+      pull(idx)
+  }
+)
+```
+
+```{r}
+# create a function that trains a random forest model on a given set of rows and 
+# predicts on a disjunct set of rows
+train_test_by_fold <- function(df, idx_train, idx_val, target, predictors){
+  
+  mod <- ranger::ranger(
+    x =  idx_train[, predictors],  # data frame with columns corresponding to predictors
+    y =  idx_train[, target],   # a vector of the target values (not a data frame!)
+  )
+  
+  pred <- predict(mod,       # the fitted model object 
+                  data = ... # a data frame with columns corresponding to predictors
+                  )
+
+  rsq <- ...  # the R-squared determined on the validation set
+  rmse <- ... # the root mean square error on the validation set
+  
+  return(tibble(rsq = rsq, rmse = rmse))
+}
+
+# apply function on each custom fold and collect validation results in a nice
+# data frame
+out <- purrr::map2_dfr(
+  group_folds_train,
+  group_folds_test,
+  ~train_test_by_fold(.x, .y)
+) |> 
+  mutate(test_fold = 1:5)
+```
+
+
+
+Plot the distribution of leaf N by cluster.
+Split your data into five folds that correspond to the geographical clusters identified by in (2.), and fit a random forest model with the same hyperparameters as above and performing a 5-fold cross-validation with the clusters as folds. Report the RMSE and the R
+determined on each of the five folds
+Compare the results of the spatial cross-validation to the results of the random cross-validation and discuss reasons for why you observe a difference in the cross-validation metrics (if you do).
+
+
+
+
+## Environmental cross-validation
